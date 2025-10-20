@@ -8,7 +8,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	pb "github.com/yourusername/grpc-file-service/proto"
+	pb "github.com/daniil1412412/grpc-file-service/proto"
 	"google.golang.org/grpc"
 )
 
