@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package fileservice;
+
+option go_package = "github.com/yourusername/grpc-file-service/proto;proto";
+
+service FileService {
+  rpc Upload(stream UploadRequest) returns (UploadResponse);
+
+  rpc Download(DownloadRequest) returns (stream DownloadResponse);
+
+  rpc ListFiles(ListRequest) returns (ListResponse);
+}
+
+message UploadRequest {
+  string filename = 1;
+  bytes data = 2;
+}
+
+message UploadResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+message DownloadRequest {
+  string filename = 1;
+}
+
+message DownloadResponse {
+  bytes data = 1;
+}
+
+message ListRequest {
+
+}
+
+message FileInfo {
+  string filename = 1;
+  string created_at = 2;   
+  string modified_at = 3;  
+  int64 size_bytes = 4;
+}
+
+message ListResponse {
+  repeated FileInfo files = 1;
+}
