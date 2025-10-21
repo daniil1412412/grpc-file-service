@@ -3,25 +3,26 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	pb "github.com/daniil1412412/grpc-file-service/proto"
+	"github.com/daniil1412412/grpc-file-service/proto"
 	"google.golang.org/grpc"
 )
 
-// fileServer implements pb.FileServiceServer
+// fileServer implements proto.FileServiceServer
 type fileServer struct {
-	pb.UnimplementedFileServiceServer
+	proto.UnimplementedFileServiceServer
 	storageDir        string
 	uploadDownloadSem chan struct{}
 	listSem           chan struct{}
 }
 
-// ---- helpers to acquire/release semaphores ----
+// ---- semaphore helpers ----
 func (s *fileServer) acquireUploadDownload(ctx context.Context) error {
 	select {
 	case s.uploadDownloadSem <- struct{}{}:
@@ -51,16 +52,8 @@ func (s *fileServer) releaseList() {
 	}
 }
 
-// ---- Interceptors (main.go uses them) ----
-// but we define them here to access methods of s
-func unaryLimitInterceptor(srv *fileServer) grpc.UnaryServerInterceptor {
-	return func(
-		ctx context.Context,
-		req interface{},
-		info *grpc.UnaryServerInfo,
-		handler grpc.UnaryHandler,
-	) (interface{}, error) {
-		// Decide which semaphore to use based on method name
+func unaryLimitInterceptor(srv *fileServer) func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 		if strings.HasSuffix(info.FullMethod, "/ListFiles") {
 			if err := srv.acquireList(ctx); err != nil {
 				return nil, err
@@ -68,7 +61,6 @@ func unaryLimitInterceptor(srv *fileServer) grpc.UnaryServerInterceptor {
 			defer srv.releaseList()
 			return handler(ctx, req)
 		}
-		// default: treat other unary as upload/download (if any)
 		if err := srv.acquireUploadDownload(ctx); err != nil {
 			return nil, err
 		}
@@ -77,15 +69,9 @@ func unaryLimitInterceptor(srv *fileServer) grpc.UnaryServerInterceptor {
 	}
 }
 
-func streamLimitInterceptor(srv *fileServer) grpc.StreamServerInterceptor {
-	return func(
-		srvInterface interface{},
-		ss grpc.ServerStream,
-		info *grpc.StreamServerInfo,
-		handler grpc.StreamHandler,
-	) error {
+func streamLimitInterceptor(srv *fileServer) func(srvInterface interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+	return func(srvInterface interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 		if strings.HasSuffix(info.FullMethod, "/Upload") || strings.HasSuffix(info.FullMethod, "/Download") {
-			// upload/download use uploadDownloadSem
 			if err := srv.acquireUploadDownload(ss.Context()); err != nil {
 				return err
 			}
@@ -99,81 +85,67 @@ func streamLimitInterceptor(srv *fileServer) grpc.StreamServerInterceptor {
 			defer srv.releaseList()
 			return handler(srvInterface, ss)
 		}
-		// default
 		return handler(srvInterface, ss)
 	}
 }
 
-// ---- RPC implementations ----
-
 func sanitizeFilename(name string) string {
-	// take base and remove path separators
 	name = filepath.Base(name)
 	name = strings.ReplaceAll(name, string(os.PathSeparator), "_")
 	return name
 }
 
-func (s *fileServer) Upload(stream pb.FileService_UploadServer) error {
-	// Expect first message to contain filename (or it can be in every message)
-	var outFile *os.File
+func (s *fileServer) Upload(stream proto.FileService_UploadServer) error {
+	if err := os.MkdirAll(s.storageDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir error: %w", err)
+	}
+
+	var f *os.File
 	var filename string
-	var receivedBytes int64
 
 	for {
 		req, err := stream.Recv()
 		if err == io.EOF {
-			// finished receiving
-			if outFile != nil {
-				_ = outFile.Close()
+			if f != nil {
+				_ = f.Close()
 			}
-			resp := &pb.UploadResponse{Ok: true, Message: "upload complete"}
-			return stream.SendAndClose(resp)
+			return stream.SendAndClose(&proto.UploadResponse{Ok: true, Message: "успешно"})
 		}
 		if err != nil {
-			if outFile != nil {
-				_ = outFile.Close()
+			if f != nil {
+				_ = f.Close()
 			}
 			return err
 		}
 
-		// determine filename
-		if filename == "" && req.GetFilename() != "" {
-			filename = sanitizeFilename(req.GetFilename())
-			targetPath := filepath.Join(s.storageDir, filename)
-
-			// create file (overwrite if exists)
-			f, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-			if err != nil {
-				return stream.SendAndClose(&pb.UploadResponse{Ok: false, Message: "failed to create file: " + err.Error()})
-			}
-			outFile = f
-		}
-
 		if filename == "" {
-			// no filename yet -> error
-			if outFile != nil {
-				_ = outFile.Close()
+			filename = sanitizeFilename(req.GetFilename())
+			if filename == "" {
+				return errors.New("название обязательно")
 			}
-			return stream.SendAndClose(&pb.UploadResponse{Ok: false, Message: "filename not provided in first messages"})
+			path := filepath.Join(s.storageDir, filename)
+			file, ferr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+			if ferr != nil {
+				return fmt.Errorf("файл успешно создан: %w", ferr)
+			}
+			f = file
 		}
 
-		data := req.GetData()
-		if len(data) > 0 {
-			n, err := outFile.Write(data)
-			if err != nil {
-				_ = outFile.Close()
-				return stream.SendAndClose(&pb.UploadResponse{Ok: false, Message: "write error: " + err.Error()})
+		if len(req.GetData()) > 0 {
+			if _, werr := f.Write(req.GetData()); werr != nil {
+				_ = f.Close()
+				return fmt.Errorf("ошибка чтения: %w", werr)
 			}
-			receivedBytes += int64(n)
 		}
 	}
 }
 
-func (s *fileServer) Download(req *pb.DownloadRequest, stream pb.FileService_DownloadServer) error {
+func (s *fileServer) Download(req *proto.DownloadRequest, stream proto.FileService_DownloadServer) error {
 	filename := sanitizeFilename(req.GetFilename())
 	if filename == "" {
-		return errors.New("empty filename")
+		return errors.New("имя файла пустое")
 	}
+
 	path := filepath.Join(s.storageDir, filename)
 	f, err := os.Open(path)
 	if err != nil {
@@ -181,49 +153,48 @@ func (s *fileServer) Download(req *pb.DownloadRequest, stream pb.FileService_Dow
 	}
 	defer f.Close()
 
-	buf := make([]byte, 64*1024) // 64KB chunks
+	buf := make([]byte, 64*1024)
 	for {
-		n, err := f.Read(buf)
+		n, rerr := f.Read(buf)
 		if n > 0 {
-			resp := &pb.DownloadResponse{Data: buf[:n]}
-			if err2 := stream.Send(resp); err2 != nil {
-				return err2
+			if serr := stream.Send(&proto.DownloadResponse{Data: buf[:n]}); serr != nil {
+				return serr
 			}
 		}
-		if err == io.EOF {
+		if rerr == io.EOF {
 			break
 		}
-		if err != nil {
-			return err
+		if rerr != nil {
+			return rerr
 		}
 	}
 	return nil
 }
 
-func (s *fileServer) ListFiles(ctx context.Context, req *pb.ListRequest) (*pb.ListResponse, error) {
+func (s *fileServer) ListFiles(ctx context.Context, req *proto.ListRequest) (*proto.ListResponse, error) {
+	if err := os.MkdirAll(s.storageDir, 0o755); err != nil {
+		return nil, err
+	}
+
 	entries, err := os.ReadDir(s.storageDir)
 	if err != nil {
 		return nil, err
 	}
-	var files []*pb.FileInfo
+	var files []*proto.FileInfo
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		name := e.Name()
-		full := filepath.Join(s.storageDir, name)
-		info, err := os.Stat(full)
+		info, err := e.Info()
 		if err != nil {
 			continue
 		}
-		created := info.ModTime() // filesystem may not store creation time portably; use ModTime as both created/updated if needed
-		modified := info.ModTime()
-		files = append(files, &pb.FileInfo{
-			Filename:   name,
-			CreatedAt:  created.Format(time.RFC3339),
-			ModifiedAt: modified.Format(time.RFC3339),
+		files = append(files, &proto.FileInfo{
+			Filename:   e.Name(),
+			CreatedAt:  info.ModTime().Format(time.RFC3339), // portable: modtime used
+			ModifiedAt: info.ModTime().Format(time.RFC3339),
 			SizeBytes:  info.Size(),
 		})
 	}
-	return &pb.ListResponse{Files: files}, nil
+	return &proto.ListResponse{Files: files}, nil
 }

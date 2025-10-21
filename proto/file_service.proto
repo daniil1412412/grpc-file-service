@@ -5,7 +5,7 @@ package fileservice;
 option go_package = "github.com/daniil1412412/grpc-file-service/proto;proto";
 
 service FileService {
-  rpc Upload(stream UploadRequest) returns (UploadResponse);
+  rpc UploadFile(stream UploadRequest) returns (UploadResponse);
 
   rpc Download(DownloadRequest) returns (stream DownloadResponse);
 
